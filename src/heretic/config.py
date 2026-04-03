@@ -1,23 +1,76 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+from enum import Enum
 from typing import Dict
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
     BaseSettings,
+    CliSettingsSource,
+    EnvSettingsSource,
     PydanticBaseSettingsSource,
-    SettingsConfigDict,
     TomlConfigSettingsSource,
 )
 
 
+class QuantizationMethod(str, Enum):
+    NONE = "none"
+    BNB_4BIT = "bnb_4bit"
+
+
+class RowNormalization(str, Enum):
+    NONE = "none"
+    PRE = "pre"
+    # POST = "post"  # Theoretically possible, but provides no advantage.
+    FULL = "full"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
-        description="Hugging Face dataset ID, or path to dataset on disk"
+        description="Hugging Face dataset ID, or path to dataset on disk."
     )
-    split: str = Field(description="Portion of the dataset to use")
-    column: str = Field(description="Column in the dataset that contains the prompts")
+
+    split: str = Field(description="Portion of the dataset to use.")
+
+    column: str = Field(description="Column in the dataset that contains the prompts.")
+
+    prefix: str = Field(
+        default="",
+        description="Text to prepend to each prompt.",
+    )
+
+    suffix: str = Field(
+        default="",
+        description="Text to append to each prompt.",
+    )
+
+    system_prompt: str | None = Field(
+        default=None,
+        description="System prompt to use with the prompts (overrides global system prompt if set).",
+    )
+
+    residual_plot_label: str | None = Field(
+        default=None,
+        description="Label to use for the dataset in plots of residual vectors.",
+    )
+
+    residual_plot_color: str | None = Field(
+        default=None,
+        description="Matplotlib color to use for the dataset in plots of residual vectors.",
+    )
+
+
+class BenchmarkSpecification(BaseModel):
+    task: str = Field(
+        description="Task ID of the benchmark in the Language Model Evaluation Harness."
+    )
+
+    name: str = Field(description="Name of the benchmark for presentation purposes.")
+
+    description: str = Field(
+        description="Description of the benchmark for presentation purposes."
+    )
 
 
 class Settings(BaseSettings):
@@ -25,7 +78,10 @@ class Settings(BaseSettings):
 
     evaluate_model: str | None = Field(
         default=None,
-        description="If this model ID or path is set, then instead of abliterating the main model, evaluate this model relative to the main model.",
+        description=(
+            "If this model ID or path is set, then instead of abliterating the main model, "
+            "evaluate this model relative to the main model."
+        ),
     )
 
     dtypes: list[str] = Field(
@@ -34,18 +90,36 @@ class Settings(BaseSettings):
             "auto",
             # If that doesn't work (e.g. on pre-Ampere hardware), fall back to float16.
             "float16",
-            # If float16 fails (e.g. due to range issues) and float32 is too large, try bfloat16.
+            # If "auto" resolves to float32, and that fails because it is too large,
+            # and float16 fails due to range issues, try bfloat16.
             "bfloat16",
-            # If that still doesn't work (e.g. due to https://github.com/meta-llama/llama/issues/380),
-            # fall back to float32.
+            # If neither of those work, fall back to float32 (which will of course fail
+            # if that was the dtype "auto" resolved to).
             "float32",
         ],
-        description="List of PyTorch dtypes to try when loading model tensors. If loading with a dtype fails, the next dtype in the list will be tried.",
+        description=(
+            "List of PyTorch dtypes to try when loading model tensors. "
+            "If loading with a dtype fails, the next dtype in the list will be tried."
+        ),
+    )
+
+    quantization: QuantizationMethod = Field(
+        default=QuantizationMethod.NONE,
+        description=(
+            "Quantization method to use when loading the model. Options: "
+            '"none" (no quantization), '
+            '"bnb_4bit" (4-bit quantization using bitsandbytes).'
+        ),
     )
 
     device_map: str | Dict[str, int | str] = Field(
         default="auto",
         description="Device map to pass to Accelerate when loading the model.",
+    )
+
+    max_memory: Dict[str, str] | None = Field(
+        default=None,
+        description='Maximum memory to allocate per device (e.g., {"0": "20GB", "cpu": "64GB"}).',
     )
 
     trust_remote_code: bool | None = Field(
@@ -68,9 +142,34 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
-    print_refusal_geometry: bool = Field(
+    print_responses: bool = Field(
         default=False,
-        description="Whether to print detailed information about residuals and refusal directions after calculating them.",
+        description="Whether to print prompt/response pairs when counting refusals.",
+    )
+
+    print_residual_geometry: bool = Field(
+        default=False,
+        description="Whether to print detailed information about residuals and refusal directions.",
+    )
+
+    plot_residuals: bool = Field(
+        default=False,
+        description="Whether to generate plots showing PaCMAP projections of residual vectors.",
+    )
+
+    residual_plot_path: str = Field(
+        default="plots",
+        description="Base path to save plots of residual vectors to.",
+    )
+
+    residual_plot_title: str = Field(
+        default='PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts',
+        description="Title placed above plots of residual vectors.",
+    )
+
+    residual_plot_style: str = Field(
+        default="dark_background",
+        description="Matplotlib style sheet to use for plots of residual vectors.",
     )
 
     kl_divergence_scale: float = Field(
@@ -78,6 +177,53 @@ class Settings(BaseSettings):
         description=(
             'Assumed "typical" value of the Kullback-Leibler divergence from the original model for abliterated models. '
             "This is used to ensure balanced co-optimization of KL divergence and refusal count."
+        ),
+    )
+
+    kl_divergence_target: float = Field(
+        default=0.01,
+        description=(
+            "The KL divergence to target. Below this value, an objective based on the refusal count is used. "
+            'This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".'
+        ),
+    )
+
+    orthogonalize_direction: bool = Field(
+        default=False,
+        description=(
+            "Whether to adjust the refusal directions so that only the component that is "
+            "orthogonal to the good direction is subtracted during abliteration."
+        ),
+    )
+
+    row_normalization: RowNormalization = Field(
+        default=RowNormalization.NONE,
+        description=(
+            "How to apply row normalization of the weights. Options: "
+            '"none" (no normalization), '
+            '"pre" (compute LoRA adapter relative to row-normalized weights), '
+            '"full" (like "pre", but renormalizes to preserve original row magnitudes).'
+        ),
+    )
+
+    full_normalization_lora_rank: int = Field(
+        default=3,
+        description=(
+            'The rank of the LoRA adapter to use when "full" row normalization is used. '
+            "Row magnitude preservation is approximate due to non-linear effects, "
+            "and this determines the rank of that approximation. Higher ranks produce "
+            "larger output files and may slow down evaluation."
+        ),
+    )
+
+    winsorization_quantile: float = Field(
+        default=1.0,
+        description=(
+            "The symmetric winsorization to apply to the per-prompt, per-layer residual vectors, "
+            "expressed as the quantile to clamp to (between 0 and 1). Disabled by default. "
+            'This can tame so-called "massive activations" that occur in some models. '
+            "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
+            "of the components, then clamps the magnitudes of all components to that quantile."
         ),
     )
 
@@ -89,6 +235,72 @@ class Settings(BaseSettings):
     n_startup_trials: int = Field(
         default=60,
         description="Number of trials that use random sampling for the purpose of exploration.",
+    )
+
+    study_checkpoint_dir: str = Field(
+        default="checkpoints",
+        description="Directory to save and load study progress to/from.",
+    )
+
+    benchmarks: list[BenchmarkSpecification] = Field(
+        default=[
+            BenchmarkSpecification(
+                task="agieval",
+                name="AGIEval",
+                description="A Human-Centric Benchmark for Evaluating Foundation Models",
+            ),
+            BenchmarkSpecification(
+                task="bbh",
+                name="BIG-Bench Hard (BBH)",
+                description="Challenging BIG-Bench Tasks and Whether Chain-of-Thought Can Solve Them",
+            ),
+            BenchmarkSpecification(
+                task="commonsense_qa",
+                name="CommonsenseQA",
+                description="A Question Answering Challenge Targeting Commonsense Knowledge",
+            ),
+            BenchmarkSpecification(
+                task="eq_bench",
+                name="EQ-Bench",
+                description="An Emotional Intelligence Benchmark for Large Language Models",
+            ),
+            BenchmarkSpecification(
+                task="gsm8k",
+                name="GSM8K",
+                description="Training Verifiers to Solve Math Word Problems",
+            ),
+            BenchmarkSpecification(
+                task="hellaswag",
+                name="HellaSwag",
+                description="Can a Machine Really Finish Your Sentence?",
+            ),
+            BenchmarkSpecification(
+                task="ifeval",
+                name="IFEval",
+                description="Instruction-Following Evaluation for Large Language Models",
+            ),
+            BenchmarkSpecification(
+                task="mmlu",
+                name="MMLU",
+                description="Measuring Massive Multitask Language Understanding",
+            ),
+            BenchmarkSpecification(
+                task="mmlu_pro",
+                name="MMLU-Pro",
+                description="A More Robust and Challenging Multi-Task Language Understanding Benchmark",
+            ),
+            BenchmarkSpecification(
+                task="piqa",
+                name="PIQA",
+                description="Reasoning about Physical Commonsense in Natural Language",
+            ),
+            BenchmarkSpecification(
+                task="winogrande",
+                name="WinoGrande",
+                description="An Adversarial Winograd Schema Challenge at Scale",
+            ),
+        ],
+        description="Benchmarks to offer to the user for evaluating abliterated models.",
     )
 
     refusal_markers: list[str] = Field(
@@ -139,6 +351,8 @@ class Settings(BaseSettings):
             dataset="mlabonne/harmless_alpaca",
             split="train[:400]",
             column="text",
+            residual_plot_label='"Harmless" prompts',
+            residual_plot_color="royalblue",
         ),
         description="Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).",
     )
@@ -148,6 +362,8 @@ class Settings(BaseSettings):
             dataset="mlabonne/harmful_behaviors",
             split="train[:400]",
             column="text",
+            residual_plot_label='"Harmful" prompts',
+            residual_plot_color="darkorange",
         ),
         description="Dataset of prompts that tend to result in refusals (used for calculating refusal directions).",
     )
@@ -170,15 +386,6 @@ class Settings(BaseSettings):
         description="Dataset of prompts that tend to result in refusals (used for evaluating model performance).",
     )
 
-    # "Model" refers to the Pydantic model of the settings class here,
-    # not to the language model. The field must have this exact name.
-    model_config = SettingsConfigDict(
-        toml_file="config.toml",
-        env_prefix="HERETIC_",
-        cli_parse_args=True,
-        cli_kebab_case=True,
-    )
-
     @classmethod
     def settings_customise_sources(
         cls,
@@ -189,9 +396,15 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
-            init_settings,
-            env_settings,
+            init_settings,  # Used during resume - should override *all* other sources.
+            CliSettingsSource(
+                settings_cls,
+                cli_parse_args=True,
+                cli_implicit_flags=True,
+                cli_kebab_case=True,
+            ),
+            EnvSettingsSource(settings_cls, env_prefix="HERETIC_"),
             dotenv_settings,
             file_secret_settings,
-            TomlConfigSettingsSource(settings_cls),
+            TomlConfigSettingsSource(settings_cls, toml_file="config.toml"),
         )
