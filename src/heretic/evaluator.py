@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import torch.nn.functional as F
+from torch import Tensor
 
 from .config import Settings
 from .model import Model
-from .utils import load_prompts, print
+from .utils import Prompt, load_prompts, print
 
 
 class Evaluator:
+    settings: Settings
+    model: Model
+    good_prompts: list[Prompt]
+    bad_prompts: list[Prompt]
+    base_logprobs: Tensor
+    base_refusals: int
+
     def __init__(self, settings: Settings, model: Model):
         self.settings = settings
         self.model = model
@@ -17,7 +25,7 @@ class Evaluator:
         print(
             f"Loading good evaluation prompts from [bold]{settings.good_evaluation_prompts.dataset}[/]..."
         )
-        self.good_prompts = load_prompts(settings.good_evaluation_prompts)
+        self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
         print("* Obtaining first-token probability distributions...")
@@ -27,7 +35,7 @@ class Evaluator:
         print(
             f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.dataset}[/]..."
         )
-        self.bad_prompts = load_prompts(settings.bad_evaluation_prompts)
+        self.bad_prompts = load_prompts(settings, settings.bad_evaluation_prompts)
         print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded")
 
         print("* Counting model refusals...")
@@ -57,9 +65,32 @@ class Evaluator:
         return False
 
     def count_refusals(self) -> int:
-        responses = self.model.get_responses_batched(self.bad_prompts)
-        refusals = [response for response in responses if self.is_refusal(response)]
-        return len(refusals)
+        refusal_count = 0
+
+        responses = self.model.get_responses_batched(
+            self.bad_prompts,
+            skip_special_tokens=True,
+        )
+
+        for prompt, response in zip(self.bad_prompts, responses):
+            is_refusal = self.is_refusal(response)
+            if is_refusal:
+                refusal_count += 1
+
+            if self.settings.print_responses:
+                print()
+                print(f"[bold]System prompt:[/] {prompt.system}")
+                print(f"[bold]Prompt:[/] {prompt.user}")
+                if not response.strip():
+                    response = "[italic]\\[empty][/]"
+                print(
+                    f"[bold]Response:[/] [{'red' if is_refusal else 'green'}]{response}[/]"
+                )
+
+        if self.settings.print_responses:
+            print()
+
+        return refusal_count
 
     def get_score(self) -> tuple[tuple[float, float], float, int]:
         print("  * Obtaining first-token probability distributions...")
@@ -79,7 +110,9 @@ class Evaluator:
         kl_divergence_scale = self.settings.kl_divergence_scale
         kl_divergence_target = self.settings.kl_divergence_target
 
-        refusals_score = refusals / self.base_refusals
+        refusals_score = (
+            refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
+        )
 
         if kl_divergence >= kl_divergence_target:
             kld_score = kl_divergence / kl_divergence_scale

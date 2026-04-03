@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import gc
 import getpass
 import os
-from dataclasses import asdict
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, TypeVar
@@ -22,12 +22,36 @@ from datasets.config import DATASET_STATE_JSON_FILENAME
 from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
 from optuna import Trial
+from psutil import Process
 from questionary import Choice, Style
 from rich.console import Console
 
 from .config import DatasetSpecification, Settings
 
 print = Console(highlight=False).print
+
+
+def print_memory_usage():
+    def p(label: str, size_in_bytes: int):
+        print(f"[grey50]{label}: [bold]{size_in_bytes / (1024**3):.2f} GB[/][/]")
+
+    p("Resident system RAM", Process().memory_info().rss)
+
+    if torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        allocated = sum(torch.cuda.memory_allocated(device) for device in range(count))
+        reserved = sum(torch.cuda.memory_reserved(device) for device in range(count))
+        p("Allocated GPU VRAM", allocated)
+        p("Reserved GPU VRAM", reserved)
+    elif is_xpu_available():
+        count = torch.xpu.device_count()
+        allocated = sum(torch.xpu.memory_allocated(device) for device in range(count))
+        reserved = sum(torch.xpu.memory_reserved(device) for device in range(count))
+        p("Allocated XPU memory", allocated)
+        p("Reserved XPU memory", reserved)
+    elif torch.backends.mps.is_available():
+        p("Allocated MPS memory", torch.mps.current_allocated_memory())
+        p("Driver (reserved) MPS memory", torch.mps.driver_allocated_memory())
 
 
 def is_notebook() -> bool:
@@ -136,7 +160,16 @@ def format_duration(seconds: float) -> str:
         return f"{seconds}s"
 
 
-def load_prompts(specification: DatasetSpecification) -> list[str]:
+@dataclass
+class Prompt:
+    system: str
+    user: str
+
+
+def load_prompts(
+    settings: Settings,
+    specification: DatasetSpecification,
+) -> list[Prompt]:
     path = specification.dataset
     split_str = specification.split
 
@@ -171,7 +204,27 @@ def load_prompts(specification: DatasetSpecification) -> list[str]:
         # Probably a repository path; let load_dataset figure it out.
         dataset = load_dataset(path, split=split_str)
 
-    return list(dataset[specification.column])
+    prompts = list(dataset[specification.column])
+
+    if specification.prefix:
+        prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]
+
+    if specification.suffix:
+        prompts = [f"{prompt} {specification.suffix}" for prompt in prompts]
+
+    system_prompt = (
+        settings.system_prompt
+        if specification.system_prompt is None
+        else specification.system_prompt
+    )
+
+    return [
+        Prompt(
+            system=system_prompt,
+            user=prompt,
+        )
+        for prompt in prompts
+    ]
 
 
 T = TypeVar("T")
@@ -212,7 +265,7 @@ def get_trial_parameters(trial: Trial) -> dict[str, str]:
     )
 
     for component, parameters in trial.user_attrs["parameters"].items():
-        for name, value in asdict(parameters).items():
+        for name, value in parameters.items():
             params[f"{component}.{name}"] = f"{value:.2f}"
 
     return params
@@ -222,9 +275,13 @@ def get_readme_intro(
     settings: Settings,
     trial: Trial,
     base_refusals: int,
-    bad_prompts: list[str],
+    bad_prompts: list[Prompt],
 ) -> str:
-    model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
+    if Path(settings.model).exists():
+        # Hide the path, which may contain private information.
+        model_link = "a model"
+    else:
+        model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
 
     return f"""# This is a decensored version of {
         model_link
