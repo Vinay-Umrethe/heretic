@@ -19,11 +19,11 @@ from accelerate.utils import (
     is_musa_available,
     is_npu_available,
     is_sdaa_available,
-    is_tpu_available,
+    is_torch_xla_available,
     is_xpu_available,
 )
 
-if is_tpu_available():
+if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
 
@@ -267,7 +267,7 @@ def get_accelerator_info_dict() -> dict[str, Any]:
 
         return info
 
-    if is_tpu_available():
+    if is_torch_xla_available():
         devices = xm.get_xla_supported_devices()
         tpu_devices = [str(device) for device in devices if "TPU" in str(device)]
 
