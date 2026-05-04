@@ -19,8 +19,12 @@ from accelerate.utils import (
     is_musa_available,
     is_npu_available,
     is_sdaa_available,
+    is_tpu_available,
     is_xpu_available,
 )
+
+if is_tpu_available():
+    import torch_xla.core.xla_model as xm
 
 
 def empty_cache():
@@ -263,6 +267,18 @@ def get_accelerator_info_dict() -> dict[str, Any]:
 
         return info
 
+    if is_tpu_available():
+        devices = xm.get_xla_supported_devices()
+        tpu_devices = [str(device) for device in devices if "TPU" in str(device)]
+
+        return {
+            "type": "TPU",
+            "api_name": "XLA Version",
+            "api_version": get_package_version("torch_xla"),
+            "driver_version": None,
+            "devices": [{"name": f"Google TPU ({device})"} for device in tpu_devices],
+        }
+
     if is_xpu_available():
         count = torch.xpu.device_count()  # ty:ignore[unresolved-attribute]
         return {
@@ -426,7 +442,13 @@ def get_requirements_dict() -> dict[str, str]:
     # We start with heretic-llm and the core compute libraries.
     # PyTorch is not listed as a dependency in the heretic-llm package
     # because installation is hardware-specific and must be done manually.
-    packages_to_check = ["heretic-llm", "torch", "torchaudio", "torchvision"]
+    packages_to_check = [
+        "heretic-llm",
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "torch_xla",
+    ]
 
     visited = set()
     required_packages = set()
