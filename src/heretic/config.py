@@ -13,6 +13,12 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+# !!!IMPORTANT!!!
+#
+# Any settings added to the classes defined in this module
+# must be evaluated for privacy implications and have
+# exclude=True set in their field definitions if appropriate.
+
 
 class QuantizationMethod(str, Enum):
     NONE = "none"
@@ -26,14 +32,30 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class ExportStrategy(str, Enum):
+    MERGE = "merge"
+    ADAPTER = "adapter"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
     )
 
-    split: str = Field(description="Portion of the dataset to use.")
+    commit: str | None = Field(
+        default=None,
+        description="Hugging Face commit hash of the dataset.",
+    )
 
-    column: str = Field(description="Column in the dataset that contains the prompts.")
+    split: str | None = Field(
+        default=None,
+        description="Portion of the dataset to use. Required for datasets, optional for plain text files.",
+    )
+
+    column: str | None = Field(
+        default=None,
+        description="Column in the dataset that contains the prompts. Required for datasets, ignored for plain text files.",
+    )
 
     prefix: str = Field(
         default="",
@@ -53,11 +75,13 @@ class DatasetSpecification(BaseModel):
     residual_plot_label: str | None = Field(
         default=None,
         description="Label to use for the dataset in plots of residual vectors.",
+        exclude=True,
     )
 
     residual_plot_color: str | None = Field(
         default=None,
         description="Matplotlib color to use for the dataset in plots of residual vectors.",
+        exclude=True,
     )
 
 
@@ -76,12 +100,37 @@ class BenchmarkSpecification(BaseModel):
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
+    model_commit: str | None = Field(
+        default=None,
+        description="Hugging Face commit hash of the model.",
+    )
+
     evaluate_model: str | None = Field(
         default=None,
         description=(
             "If this model ID or path is set, then instead of abliterating the main model, "
             "evaluate this model relative to the main model."
         ),
+        exclude=True,
+    )
+
+    collect_reproducibles: str | None = Field(
+        default=None,
+        description=(
+            "If this directory path is set, then instead of abliterating a model, "
+            "download all reproduce.json files from public Heretic model repositories "
+            "on Hugging Face, and store them in that directory for archival purposes."
+        ),
+        exclude=True,
+    )
+
+    reproduce: str | None = Field(
+        default=None,
+        description=(
+            "If this path or URL to a reproduce.json file is set, load reproduction information "
+            "from that file, and attempt to reproduce the abliterated model it originated from."
+        ),
+        exclude=True,
     )
 
     dtypes: list[str] = Field(
@@ -119,12 +168,17 @@ class Settings(BaseSettings):
 
     max_memory: Dict[str, str] | None = Field(
         default=None,
-        description='Maximum memory to allocate per device (e.g., {"0": "20GB", "cpu": "64GB"}).',
+        description='Maximum memory to allocate per device (e.g., { "0" = "20GB", "cpu" = "64GB" }).',
     )
 
-    trust_remote_code: bool | None = Field(
-        default=None,
-        description="Whether to trust remote code when loading the model.",
+    offload_outputs_to_cpu: bool = Field(
+        default=True,
+        description=(
+            "Whether to move intermediate analysis tensors (such as residuals and logprobs) "
+            "to CPU memory as soon as possible to reduce peak VRAM usage. "
+            "This lowers peak VRAM usage during residual analysis and evaluation, "
+            "but may slightly reduce performance due to host/device transfers."
+        ),
     )
 
     batch_size: int = Field(
@@ -135,6 +189,9 @@ class Settings(BaseSettings):
     max_batch_size: int = Field(
         default=128,
         description="Maximum batch size to try when automatically determining the optimal batch size.",
+        # When storing a settings object, the batch size is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
     )
 
     max_response_length: int = Field(
@@ -142,34 +199,82 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
+    response_prefix: str | None = Field(
+        default=None,
+        description=(
+            "Common prefix to assume for all responses, so that evaluation happens "
+            "at the point where responses start to differ for different prompts. "
+            "If not set, the prefix is determined automatically by comparing multiple responses."
+        ),
+    )
+
+    chain_of_thought_skips: list[tuple[str, str]] = Field(
+        default=[
+            # Most thinking models.
+            (
+                "<think>",
+                "<think></think>",
+            ),
+            # gpt-oss.
+            (
+                "<|channel|>analysis<|message|>",
+                "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>",
+            ),
+            # Unknown, suggested by user.
+            (
+                "<thought>",
+                "<thought></thought>",
+            ),
+            # Unknown, suggested by user.
+            (
+                "[THINK]",
+                "[THINK][/THINK]",
+            ),
+        ],
+        description=(
+            "List of pairs of the form (cot_initializer, closed_cot_block) used to skip "
+            "the Chain-of-Thought block in responses, so that evaluation happens "
+            "at the start of the actual response."
+        ),
+        # When storing a settings object, the response prefix is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
+    )
+
     print_responses: bool = Field(
         default=False,
         description="Whether to print prompt/response pairs when counting refusals.",
+        exclude=True,
     )
 
     print_residual_geometry: bool = Field(
         default=False,
         description="Whether to print detailed information about residuals and refusal directions.",
+        exclude=True,
     )
 
     plot_residuals: bool = Field(
         default=False,
         description="Whether to generate plots showing PaCMAP projections of residual vectors.",
+        exclude=True,
     )
 
     residual_plot_path: str = Field(
         default="plots",
         description="Base path to save plots of residual vectors to.",
+        exclude=True,
     )
 
     residual_plot_title: str = Field(
         default='PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts',
         description="Title placed above plots of residual vectors.",
+        exclude=True,
     )
 
     residual_plot_style: str = Field(
         default="dark_background",
         description="Matplotlib style sheet to use for plots of residual vectors.",
+        exclude=True,
     )
 
     kl_divergence_scale: float = Field(
@@ -189,7 +294,7 @@ class Settings(BaseSettings):
     )
 
     orthogonalize_direction: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Whether to adjust the refusal directions so that only the component that is "
             "orthogonal to the good direction is subtracted during abliteration."
@@ -197,7 +302,7 @@ class Settings(BaseSettings):
     )
 
     row_normalization: RowNormalization = Field(
-        default=RowNormalization.NONE,
+        default=RowNormalization.FULL,
         description=(
             "How to apply row normalization of the weights. Options: "
             '"none" (no normalization), '
@@ -237,9 +342,18 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    seed: int | None = Field(
+        default=None,
+        description=(
+            "Random seed for reproducible optimization. "
+            "Applies to Python's random module, NumPy, PyTorch, and Optuna."
+        ),
+    )
+
     study_checkpoint_dir: str = Field(
         default="checkpoints",
         description="Directory to save and load study progress to/from.",
+        exclude=True,
     )
 
     benchmarks: list[BenchmarkSpecification] = Field(
@@ -301,10 +415,22 @@ class Settings(BaseSettings):
             ),
         ],
         description="Benchmarks to offer to the user for evaluating abliterated models.",
+        exclude=True,
+    )
+
+    export_strategy: ExportStrategy | None = Field(
+        default=None,
+        description='How to export the model: "merge", "adapter", or unset to prompt the user.',
+    )
+
+    max_shard_size: int | str = Field(
+        default="5GB",
+        description="Maximum size for individual safetensors files generated when exporting a model.",
     )
 
     refusal_markers: list[str] = Field(
         default=[
+            "disclaimer",
             "sorry",
             "i can'",
             "i cant",

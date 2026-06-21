@@ -1,32 +1,45 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-import gc
 import getpass
+import hashlib
+import json
 import os
+import platform
+import random
+import tempfile
+import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, TypeVar
 
+import huggingface_hub
+import numpy as np
 import questionary
+import tomli_w
 import torch
-from accelerate.utils import (
-    is_mlu_available,
-    is_musa_available,
-    is_sdaa_available,
-    is_xpu_available,
-)
 from datasets import DatasetDict, ReadInstruction, load_dataset, load_from_disk
 from datasets.config import DATASET_STATE_JSON_FILENAME
 from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
+from huggingface_hub.utils import validate_repo_id
 from optuna import Trial
+from optuna.trial import FrozenTrial
 from psutil import Process
 from questionary import Choice, Style
 from rich.console import Console
 
 from .config import DatasetSpecification, Settings
+from .system import (
+    get_accelerator_info_dict,
+    get_cpu_info_dict,
+    get_heretic_version_info,
+    get_python_env_info_dict,
+    get_requirements_dict,
+    is_xpu_available,
+)
 
 print = Console(highlight=False).print
 
@@ -160,10 +173,52 @@ def format_duration(seconds: float) -> str:
         return f"{seconds}s"
 
 
+def format_exception(error: Exception) -> str:
+    # Walk causal chain to find a non-empty message.
+    current = error
+    while current is not None:
+        message = str(current).strip()
+        if message:
+            return message
+        current = current.__cause__ or current.__context__
+
+    # If there is no message in the entire causal chain, fall back to the complete traceback.
+    return traceback.format_exc().strip()
+
+
+def is_hf_path(path: str) -> bool:
+    """Checks whether a path likely refers to a Hugging Face repository."""
+
+    # Match Transformers: Existing local paths take precedence over Hub lookup,
+    # even if the path string is also a valid repository ID.
+    if Path(path).exists():
+        return False
+
+    validate_repo_id(path)
+    return True
+
+
 @dataclass
 class Prompt:
     system: str
     user: str
+
+
+def get_split_slice(split_str: str, length: int) -> tuple[int, int]:
+    """Resolves a split specification into absolute (start, end) indices."""
+
+    # The split name is the part before the slice, e.g. "train" in "train[:400]".
+    split_name = split_str.split("[")[0]
+
+    # Associate the split with its number of examples (lines).
+    name_to_length = {split_name: length}
+
+    # Convert the instructions to absolute indices and select the first one.
+    absolute_instruction = ReadInstruction.from_spec(split_str).to_absolute(
+        name_to_length
+    )[0]
+
+    return absolute_instruction.from_, absolute_instruction.to
 
 
 def load_prompts(
@@ -173,25 +228,43 @@ def load_prompts(
     path = specification.dataset
     split_str = specification.split
 
-    if os.path.isdir(path):
-        if Path(path, DATASET_STATE_JSON_FILENAME).exists():
+    if os.path.isfile(path):
+        # Plain text file with one prompt per line. Empty lines are ignored.
+        with open(path, encoding="utf-8") as file:
+            prompts = [line.strip() for line in file if line.strip()]
+
+        # The split is optional for text files. When given, it selects a subset
+        # of the lines using slice notation (e.g. "[:400]"). A synthetic split
+        # name is prepended because ReadInstruction expects a named split.
+        if split_str is not None:
+            start, end = get_split_slice(f"_{split_str}", len(prompts))
+            prompts = prompts[start:end]
+    else:
+        # All dataset sources require an explicit split and column.
+        if split_str is None:
+            raise ValueError(f'The "split" field is required for datasets: {path}')
+
+        if specification.column is None:
+            raise ValueError(f'The "column" field is required for datasets: {path}')
+
+        if is_hf_path(path):
+            dataset = load_dataset(
+                path,
+                revision=specification.commit,
+                split=split_str,
+            )
+        elif Path(path, DATASET_STATE_JSON_FILENAME).exists():
             # Dataset saved with datasets.save_to_disk; needs special handling.
             # Path should be the subdirectory for a particular split.
             dataset = load_from_disk(path)
             assert not isinstance(dataset, DatasetDict), (
                 "Loading dataset dicts is not supported"
             )
-            # Parse the split instructions.
-            instruction = ReadInstruction.from_spec(split_str)
-            # Associate the split with its number of examples (lines).
-            split_name = str(dataset.split)
-            name2len = {split_name: len(dataset)}
-            # Convert the instructions to absolute indices and select the first one.
-            abs_instruction = instruction.to_absolute(name2len)[0]
-            # Get the dataset by applying the indices.
-            dataset = dataset[abs_instruction.from_ : abs_instruction.to]
+            # Parse the split instructions and apply them.
+            start, end = get_split_slice(split_str, len(dataset))
+            dataset = dataset[start:end]
         else:
-            # Path is a local directory.
+            # Path should be a local directory.
             dataset = load_dataset(
                 path,
                 split=split_str,
@@ -200,11 +273,8 @@ def load_prompts(
                 # But also don't use cached data, as the dataset may have changed on disk.
                 download_mode=DownloadMode.FORCE_REDOWNLOAD,
             )
-    else:
-        # Probably a repository path; let load_dataset figure it out.
-        dataset = load_dataset(path, split=split_str)
 
-    prompts = list(dataset[specification.column])
+        prompts = list(dataset[specification.column])
 
     if specification.prefix:
         prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]
@@ -234,29 +304,7 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def empty_cache():
-    # Collecting garbage is not an idempotent operation, and to avoid OOM errors,
-    # gc.collect() has to be called both before and after emptying the backend cache.
-    # See https://github.com/p-e-w/heretic/pull/17 for details.
-    gc.collect()
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif is_xpu_available():
-        torch.xpu.empty_cache()
-    elif is_mlu_available():
-        torch.mlu.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif is_sdaa_available():
-        torch.sdaa.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif is_musa_available():
-        torch.musa.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-
-    gc.collect()
-
-
-def get_trial_parameters(trial: Trial) -> dict[str, str]:
+def get_trial_parameters(trial: Trial | FrozenTrial) -> dict[str, str]:
     params = {}
 
     direction_index = trial.user_attrs["direction_index"]
@@ -273,20 +321,29 @@ def get_trial_parameters(trial: Trial) -> dict[str, str]:
 
 def get_readme_intro(
     settings: Settings,
-    trial: Trial,
-    base_refusals: int,
-    bad_prompts: list[Prompt],
+    trial: Trial | FrozenTrial,
+    contains_reproducibility_information: bool,
 ) -> str:
-    if Path(settings.model).exists():
+    if is_hf_path(settings.model):
+        model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
+    else:
         # Hide the path, which may contain private information.
         model_link = "a model"
+
+    if contains_reproducibility_information:
+        reproducibility_instructions = """
+> [!TIP]
+> **This model is reproducible!**
+>
+> See the [README](reproduce/README.md) in the `reproduce` directory for more information.
+"""
     else:
-        model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
+        reproducibility_instructions = ""
 
     return f"""# This is a decensored version of {
         model_link
-    }, made using [Heretic](https://github.com/p-e-w/heretic) v{version("heretic-llm")}
-
+    }, made using [Heretic](https://heretic-project.org) v{version("heretic-llm")}
+{reproducibility_instructions}
 ## Abliteration parameters
 
 | Parameter | Value |
@@ -305,10 +362,423 @@ def get_readme_intro(
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
 | **KL divergence** | {trial.user_attrs["kl_divergence"]:.4f} | 0 *(by definition)* |
-| **Refusals** | {trial.user_attrs["refusals"]}/{len(bad_prompts)} | {base_refusals}/{
-        len(bad_prompts)
-    } |
+| **Refusals** | {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]} | {
+        trial.user_attrs["base_refusals"]
+    }/{trial.user_attrs["n_bad_prompts"]} |
 
 -----
 
 """
+
+
+def generate_config_toml(settings: Settings) -> str:
+    """Serializes the full Settings object to TOML."""
+
+    return tomli_w.dumps(settings.model_dump(exclude_none=True))
+
+
+def generate_requirements_txt() -> str:
+    """Collects direct project dependencies as a formatted string."""
+
+    requirements = [
+        f"{package}=={version}" for package, version in get_requirements_dict().items()
+    ]
+    return "\n".join(requirements) + "\n"
+
+
+def set_seed(seed: int):
+    """Sets the seed for all RNGs."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def format_hf_link(
+    path: str,
+    commit: str | None = None,
+    is_dataset: bool = False,
+) -> str:
+    prefix = "datasets/" if is_dataset else ""
+    base_url = f"https://huggingface.co/{prefix}{path}"
+    link = f"[{path}]({base_url})"
+
+    if commit:
+        commit_url = f"{base_url}/commit/{commit}"
+        link += f" (Commit: [`{commit[:7]}`]({commit_url}))"
+
+    return link
+
+
+def generate_reproduce_readme(
+    settings: Settings,
+    checkpoint_filename: str,
+    trial: Trial | FrozenTrial,
+    include_system_information: bool,
+) -> str:
+    """Generates the contents of a README.md for the reproduce/ folder."""
+
+    heterogeneous_warning = ""
+
+    if include_system_information:
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            if count > 1:
+                device_names = {torch.cuda.get_device_name(i) for i in range(count)}
+                if len(device_names) > 1:
+                    heterogeneous_warning = """
+> [!WARNING]
+> **Heterogeneous GPUs**
+>
+> This model was generated using multiple non-identical GPUs. When operations are distributed across different GPUs
+> (e.g. via `device_map='auto'`), non-deterministic behavior can occur.
+>
+> Reproducibility *cannot* be guaranteed in this environment.
+"""
+
+        cpu = get_cpu_info_dict()
+        python_env = get_python_env_info_dict()
+
+        accelerators = get_accelerator_info_dict()
+        if accelerators["type"] is None:
+            accelerator_report = "**No GPU or other accelerator detected.**"
+        else:
+            devices = accelerators["devices"]
+            total_vram = sum(device.get("vram_gb", 0) for device in devices)
+            vram_suffix = f" ({total_vram:.2f} GB total VRAM)" if total_vram > 0 else ""
+            accelerator_lines = [
+                f"- **{accelerators['type']}:** Detected {len(devices)} device(s){vram_suffix}"
+            ]
+
+            if accelerators.get("api_name") and accelerators.get("api_version"):
+                accelerator_lines.append(
+                    f"  - **{accelerators['api_name']}:** {accelerators['api_version']}"
+                )
+
+            if accelerators.get("driver_version"):
+                accelerator_lines.append(
+                    f"  - **Driver Version:** {accelerators['driver_version']}"
+                )
+
+            accelerator_lines.append("- **Devices:**")
+            for i, device in enumerate(devices):
+                vram = f" ({device['vram_gb']:.2f} GB)" if device.get("vram_gb") else ""
+                accelerator_lines.append(
+                    f"  - **{accelerators['type']} {i}:** {device['name']}{vram}"
+                )
+            accelerator_report = "\n".join(accelerator_lines)
+
+        system_report = f"""## System
+
+- **Python:** {python_env["version"]} ({python_env["implementation"]}, {python_env["compiler"]}) [{python_env["environment"]}]
+- **Operating system:** {platform.platform()} ({platform.machine()})
+- **CPU:** {cpu["brand"] or "Unknown"}
+
+### Accelerators
+
+{accelerator_report}
+
+"""
+        system_instructions = (
+            "1. Ensure your system matches the specifications in the **System** section above. "
+            "Exact reproducibility is only guaranteed if all aspects of your system are identical to the one the model was originally generated on.\n"
+        )
+    else:
+        system_report = ""
+        system_instructions = ""
+
+    version_info = get_heretic_version_info()
+    origin_warning = ""
+    if not version_info.is_standard_pypi:
+        if version_info.origin and version_info.origin.startswith("Git"):
+            repo_info = version_info.origin.split("Git (")[1].rstrip(")")
+            origin_warning = f"""
+> [!IMPORTANT]
+> **Git installation**
+>
+> This system installed Heretic from a Git repository: {repo_info}
+>
+> To reproduce the model, you must install Heretic from this exact repository and commit.
+"""
+        elif version_info.origin == "Local":
+            origin_warning = """
+> [!WARNING]
+> **Local code**
+>
+> This system installed Heretic from a local directory or wheel. Uncommitted or experimental code may have been executed.
+>
+> Reproducibility *cannot* be guaranteed in this environment.
+"""
+        else:
+            origin_warning = """
+> [!WARNING]
+> **Non-standard installation**
+>
+> This system installed Heretic from an unknown non-standard source.
+>
+> Reproducibility *cannot* be guaranteed in this environment.
+"""
+
+    pytorch_version = torch.__version__
+    pytorch_install_command = f"pip install torch=={pytorch_version}"
+    if "+" in pytorch_version:
+        suffix = pytorch_version.split("+")[1]
+        if suffix:
+            pytorch_install_command += (
+                f" --index-url https://download.pytorch.org/whl/{suffix}"
+            )
+
+    return f"""# Reproduction guide
+
+This directory contains the necessary information and assets to reproduce the results obtained during this Heretic run.{heterogeneous_warning}{origin_warning}
+
+## Models
+
+- **Base model:** {format_hf_link(settings.model, settings.model_commit)}
+
+## Datasets
+
+- **Good prompts:** {format_hf_link(settings.good_prompts.dataset, settings.good_prompts.commit, is_dataset=True)}
+- **Bad prompts:** {format_hf_link(settings.bad_prompts.dataset, settings.bad_prompts.commit, is_dataset=True)}
+- **Good evaluation prompts:** {format_hf_link(settings.good_evaluation_prompts.dataset, settings.good_evaluation_prompts.commit, is_dataset=True)}
+- **Bad evaluation prompts:** {format_hf_link(settings.bad_evaluation_prompts.dataset, settings.bad_evaluation_prompts.commit, is_dataset=True)}
+
+## Selected trial
+
+- **Trial number:** {trial.user_attrs["index"]}
+- **KL divergence:** {trial.user_attrs["kl_divergence"]:.6f}
+- **Refusals:** {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]}
+
+{system_report}## Environment
+
+- **Heretic:** v{version_info.version}{f" (Origin: {version_info.origin})" if version_info.origin else ""}
+- **PyTorch:** {pytorch_version}
+- **Other dependencies:** See [`requirements.txt`](requirements.txt).
+
+## Contents of this directory
+
+- [`requirements.txt`](requirements.txt): The exact versions of all Python packages.
+- [`config.toml`](config.toml): The exact configuration used, including the RNG seed.
+- [`{checkpoint_filename}`]({checkpoint_filename}): The Optuna study journal containing the history of all trials.
+- [`SHA256SUMS`](SHA256SUMS): Cryptographic hashes for all weight files.
+- [`reproduce.json`](reproduce.json): A machine-readable file containing all reproducibility information.
+
+## How to reproduce
+
+> [!TIP]
+> You can automate this process, including all verification steps, by downloading the `reproduce.json` file and running
+> `heretic --reproduce reproduce.json`.
+
+{system_instructions}1. Install the exact version of Heretic indicated in the **Environment** section above, from its original source.
+1. Install the packages listed in `requirements.txt`: `pip install -r requirements.txt`
+1. Install the correct version of PyTorch: `{pytorch_install_command}`
+1. Place the provided `config.toml` in your working directory.
+1. Run Heretic without any additional arguments: `heretic`
+1. Wait for the run to finish, then select trial **{trial.user_attrs["index"]}** and export the model.
+1. Verify that the weight files have been exactly reproduced by comparing their SHA-256 hashes against those in `SHA256SUMS`:
+   `sha256sum -c SHA256SUMS` (or look at the hashes online if you uploaded to Hugging Face)
+
+> [!TIP]
+> To use the included Optuna study journal `{checkpoint_filename}`, place it in the checkpoints directory (usually `checkpoints/`) before running Heretic.
+>
+> This allows you to export other models from the Pareto front, or to run additional trials without having to re-run the stored trials.
+"""
+
+
+def generate_reproduce_json(
+    settings: Settings,
+    trial: Trial | FrozenTrial,
+    timestamp: str,
+    uploaded_model_hashes: dict[str, str],
+    include_system_information: bool,
+) -> str:
+    """Generates the contents of a reproduce.json file for the reproduce/ folder."""
+
+    version_info = get_heretic_version_info()
+
+    data = {
+        "version": "2",  # Version number of the reproduce.json file format, to allow for future changes.
+        "timestamp": timestamp,
+        "system": None,  # Defined here to preserve insertion order.
+        "environment": {
+            "heretic": {
+                "version": version_info.version,
+                "is_standard_pypi": version_info.is_standard_pypi,
+                "metadata": version_info.metadata,
+            },
+            "pytorch_version": torch.__version__,
+            "requirements": get_requirements_dict(),
+        },
+        "settings": settings.model_dump(),
+        "parameters": {
+            "direction_index": trial.user_attrs["direction_index"],
+            "abliteration_parameters": trial.user_attrs["parameters"],
+        },
+        "metrics": {
+            "kl_divergence": trial.user_attrs["kl_divergence"],
+            "refusals": trial.user_attrs["refusals"],
+            "base_refusals": trial.user_attrs["base_refusals"],
+            "n_bad_prompts": trial.user_attrs["n_bad_prompts"],
+        },
+        "hashes": uploaded_model_hashes,
+    }
+
+    if include_system_information:
+        data["system"] = {
+            "python": get_python_env_info_dict(),
+            "os": {
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+            },
+            "cpu": get_cpu_info_dict(),
+            "accelerators": get_accelerator_info_dict(),
+        }
+    else:
+        del data["system"]
+
+    return json.dumps(data, indent=4)
+
+
+def generate_sha256sums(hashes: dict[str, str]) -> str:
+    """Generates GNU Coreutils compatible SHA256SUMS file content."""
+
+    lines = []
+
+    for filename, sha256 in sorted(hashes.items()):
+        # Use '*' to indicate binary mode for model weights.
+        lines.append(f"{sha256} *{filename}")
+
+    return "\n".join(lines) + "\n"
+
+
+# TODO: Replace this with hashlib.file_digest when we drop support for Python 3.10.
+def get_file_sha256(file_path: str | Path) -> str:
+    hash = hashlib.sha256()
+
+    with open(file_path, "rb") as file:
+        # Read the file in 64 kB blocks.
+        for block in iter(lambda: file.read(65536), b""):
+            hash.update(block)
+
+    return hash.hexdigest()
+
+
+def create_reproduce_folder(
+    path: Path,
+    settings: Settings,
+    checkpoint_path: str | Path,
+    trial: Trial | FrozenTrial,
+    uploaded_model_hashes: dict[str, str],
+    include_system_information: bool,
+):
+    reproduce_dir = path / "reproduce"
+    reproduce_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_filename = Path(checkpoint_path).name
+
+    # Fetch commit hash for the base model.
+    settings.model_commit = huggingface_hub.model_info(settings.model).sha
+
+    # Fetch commit hashes for all HF datasets to ensure reproducibility.
+    for spec in [
+        settings.good_prompts,
+        settings.bad_prompts,
+        settings.good_evaluation_prompts,
+        settings.bad_evaluation_prompts,
+    ]:
+        spec.commit = huggingface_hub.dataset_info(spec.dataset).sha
+
+    # Strip microseconds and timezone for a clean format.
+    timestamp = (
+        datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat()
+    )
+
+    (reproduce_dir / "requirements.txt").write_text(
+        generate_requirements_txt(),
+        encoding="utf-8",
+    )
+
+    (reproduce_dir / "config.toml").write_text(
+        generate_config_toml(settings),
+        encoding="utf-8",
+    )
+
+    if uploaded_model_hashes:
+        (reproduce_dir / "SHA256SUMS").write_text(
+            generate_sha256sums(uploaded_model_hashes),
+            encoding="utf-8",
+        )
+
+    (reproduce_dir / "reproduce.json").write_text(
+        generate_reproduce_json(
+            settings,
+            trial,
+            timestamp=timestamp,
+            uploaded_model_hashes=uploaded_model_hashes,
+            include_system_information=include_system_information,
+        ),
+        encoding="utf-8",
+    )
+
+    (reproduce_dir / "README.md").write_text(
+        generate_reproduce_readme(
+            settings,
+            checkpoint_filename,
+            trial,
+            include_system_information=include_system_information,
+        ),
+        encoding="utf-8",
+    )
+
+    # Copy Optuna study journal.
+    checkpoint_file = Path(checkpoint_path)
+    if checkpoint_file.exists():
+        (reproduce_dir / checkpoint_file.name).write_bytes(checkpoint_file.read_bytes())
+
+
+def upload_reproduce_folder(
+    repo_id: str,
+    settings: Settings,
+    token: str,
+    checkpoint_path: str | Path,
+    trial: Trial | FrozenTrial,
+    include_system_information: bool,
+):
+    api = huggingface_hub.HfApi()
+    info = api.model_info(repo_id=repo_id, files_metadata=True, token=token)
+
+    if not info.siblings:
+        raise RuntimeError("Could not fetch uploaded model hashes.")
+
+    # For weights, we only care about safetensors.
+    weight_extensions = (".safetensors",)
+
+    uploaded_model_hashes = {}
+
+    for file in info.siblings:
+        if file.rfilename.endswith(weight_extensions):
+            sha256 = getattr(file, "lfs", {}).get("sha256")
+            if not sha256:
+                raise RuntimeError("Could not fetch uploaded model hashes.")
+            uploaded_model_hashes[file.rfilename] = sha256
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        create_reproduce_folder(
+            tmp_path,
+            settings,
+            checkpoint_path=checkpoint_path,
+            trial=trial,
+            uploaded_model_hashes=uploaded_model_hashes,
+            include_system_information=include_system_information,
+        )
+
+        reproduce_dir = tmp_path / "reproduce"
+        for file_path in reproduce_dir.iterdir():
+            if file_path.is_file():
+                huggingface_hub.upload_file(
+                    path_or_fileobj=str(file_path),
+                    path_in_repo=f"reproduce/{file_path.name}",
+                    repo_id=repo_id,
+                    token=token,
+                )
