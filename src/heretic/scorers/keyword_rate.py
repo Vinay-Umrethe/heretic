@@ -99,10 +99,21 @@ class KeywordRate(Scorer):
     def get_score(self, ctx: Context) -> Score:
         match_count = 0
         responses = ctx.get_responses(self.prompts)
+        records = []
         for prompt, response in zip(self.prompts, responses):
             is_match = self._is_match(response)
             if is_match:
                 match_count += 1
+            records.append(
+                {
+                    "system": prompt.system,
+                    "user": prompt.user,
+                    # Generic verdict key shared by all plugins, so records
+                    # from different scorers can be joined and compared
+                    # without arbitrary, plugin-specific key names.
+                    "is_refusal": is_match,
+                }
+            )
 
             if self.settings.print_responses:
                 print()
@@ -123,6 +134,7 @@ class KeywordRate(Scorer):
             value=float(match_count / len(self.prompts)),
             rich_display=f"[bold]{match_count}[/]/{len(self.prompts)}",
             md_display=f"{match_count}/{len(self.prompts)}",
+            records=records,
         )
 
     def _is_match(self, response: str) -> bool:

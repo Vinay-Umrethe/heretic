@@ -573,7 +573,7 @@ def run():
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
-        for name, score in evaluator.get_scores():
+        for name, score in evaluator.get_scores(trial_index="evaluate"):
             print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
         return
 
@@ -625,7 +625,7 @@ def run():
         print(f"* Modifying model using {modifier_name}...")
         modifier.modify_model(ctx, parameters)
         print("* Evaluating...")
-        scores = evaluator.get_scores()
+        scores = evaluator.get_scores(trial_index=trial_index)
         objective_values = evaluator.get_objective_values(scores)
         for name, score in scores:
             print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")

@@ -35,6 +35,12 @@ class Evaluator:
         self.settings = settings
         self.model = model
         self._scorer_entries: list[ScorerEntry] = []
+        # Maps a scorer's prompt list (identified by its (system, user)
+        # pairs) to the dataset specification it was loaded from. Shared
+        # across all Contexts, because scorers load their prompts once
+        # in their init() Context, while scores are computed in a fresh
+        # Context per trial.
+        self._dataset_specifications_by_prompt_list: dict = {}
 
         print()
         print("Loading and initializing scorers...")
@@ -107,7 +113,13 @@ class Evaluator:
             )
 
         # Run scorer init hooks.
-        ctx = Context(settings=self.settings, model=self.model)
+        ctx = Context(
+            settings=self.settings,
+            model=self.model,
+            dataset_specifications_by_prompt_list=(
+                self._dataset_specifications_by_prompt_list
+            ),
+        )
 
         for entry in self._scorer_entries:
             entry.scorer.init(ctx)
@@ -138,17 +150,30 @@ class Evaluator:
             is_builtin_plugin(entry.config.plugin) for entry in self._scorer_entries
         )
 
-    def get_scores(self) -> list[tuple[str, Score]]:
+    def get_scores(
+        self, trial_index: int | str | None = None
+    ) -> list[tuple[str, Score]]:
         """
         Run all scorers and return their scores and names
 
         Returns:
             List of `Score` from each scorer and its name.
         """
-        ctx = Context(settings=self.settings, model=self.model)
-        return [
-            (entry.name, entry.scorer.get_score(ctx)) for entry in self._scorer_entries
-        ]
+        ctx = Context(
+            settings=self.settings,
+            model=self.model,
+            dataset_specifications_by_prompt_list=(
+                self._dataset_specifications_by_prompt_list
+            ),
+        )
+        ctx.trial_index = trial_index
+        results = []
+        for scorer_entry in self._scorer_entries:
+            ctx.current_scorer = type(scorer_entry.scorer).__name__
+            score = scorer_entry.scorer.get_score(ctx)
+            ctx.flush_response_rows(score)
+            results.append((scorer_entry.name, score))
+        return results
 
     def get_baseline_scores(self) -> list[tuple[str, Score]]:
         """
@@ -157,11 +182,21 @@ class Evaluator:
         Returns:
             List of `Score` from each scorer and its name.
         """
-        ctx = Context(settings=self.settings, model=self.model)
-        return [
-            (entry.name, entry.scorer.get_baseline_score(ctx))
-            for entry in self._scorer_entries
-        ]
+        ctx = Context(
+            settings=self.settings,
+            model=self.model,
+            dataset_specifications_by_prompt_list=(
+                self._dataset_specifications_by_prompt_list
+            ),
+        )
+        ctx.trial_index = "baseline"
+        results = []
+        for scorer_entry in self._scorer_entries:
+            ctx.current_scorer = type(scorer_entry.scorer).__name__
+            score = scorer_entry.scorer.get_baseline_score(ctx)
+            ctx.flush_response_rows(score)
+            results.append((scorer_entry.name, score))
+        return results
 
     def get_paired_score_records(
         self, scores: list[tuple[str, Score]]

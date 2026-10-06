@@ -18,11 +18,13 @@ class Score:
     - `value`: scalar value used for optimization (if enabled).
     - `rich_display`: formatted Rich markup shown to the user in logs/console.
     - `md_display`: formatted value in the HF model card.
+    - `records`: optional per-prompt results (e.g. verdicts from a scorer).
     """
 
     value: float
     rich_display: str
     md_display: str
+    records: list[dict] | None = None
 
 
 class Scorer(Plugin, ABC):

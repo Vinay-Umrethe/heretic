@@ -4,6 +4,8 @@
 import importlib
 import importlib.util
 import inspect
+import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -153,13 +155,67 @@ class Context:
     Acts as a quasi-API for plugins to access Heretic functionality.
     """
 
-    def __init__(self, settings: HereticSettings, model: Model) -> None:
+    def __init__(
+        self,
+        settings: HereticSettings,
+        model: Model,
+        dataset_specifications_by_prompt_list: dict | None = None,
+    ) -> None:
         self._model = model
         self._settings = settings
         self._responses_cache: dict[tuple[tuple[str, str], ...], list[str]] = {}
+        # Passed in by the Evaluator so dataset specifications loaded
+        # during init() are available in per-trial Contexts.
+        self._dataset_specifications_by_prompt_list: dict[
+            tuple[tuple[str, str], ...], dict | list[dict]
+        ] = (
+            dataset_specifications_by_prompt_list
+            if dataset_specifications_by_prompt_list is not None
+            else {}
+        )
+        self.trial_index: int | str | None = None
+        self.current_scorer: str | None = None
+
+        self._pending_response_rows: list[dict[str, Any]] = []
+        self._response_log_path: Path | None = None
+        if settings.response_log_dir is not None:
+            os.makedirs(settings.response_log_dir, exist_ok=True)
+            self._response_log_path = (
+                Path(settings.response_log_dir) / "responses.jsonl"
+            )
 
     def _cache_key(self, prompts: list[Prompt]) -> tuple[tuple[str, str], ...]:
-        return tuple((p.system, p.user) for p in prompts)
+        return tuple((prompt.system, prompt.user) for prompt in prompts)
+
+    def _log_responses(self, prompts: list[Prompt], responses: list[str]) -> None:
+        if self._response_log_path is None:
+            return
+
+        key = self._cache_key(prompts)
+
+        row: dict[str, Any] = {
+            "trial": self.trial_index,
+            "scorer": self.current_scorer,
+            "dataset": self._dataset_specifications_by_prompt_list.get(key),
+            "prompts": [
+                {"system": prompt.system, "user": prompt.user} for prompt in prompts
+            ],
+            "responses": responses,
+        }
+
+        self._pending_response_rows.append(row)
+
+    def flush_response_rows(self, score: Any | None = None) -> None:
+        """Write buffered response rows, attaching the scorer's verdicts."""
+        if self._response_log_path is not None:
+            with open(
+                self._response_log_path, "a", encoding="utf-8"
+            ) as response_log_file:
+                for row in self._pending_response_rows:
+                    if score is not None:
+                        row["verdicts"] = score.records
+                    response_log_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._pending_response_rows.clear()
 
     def get_responses(self, prompts: list[Prompt]) -> list[str]:
         """Get model responses (cached within this context)."""
@@ -168,6 +224,7 @@ class Context:
             self._responses_cache[key] = self._model.get_responses_batched(
                 prompts, skip_special_tokens=True
             )
+        self._log_responses(prompts, self._responses_cache[key])
         return self._responses_cache[key]
 
     def get_logits(self, prompts: list[Prompt]) -> Tensor:
@@ -184,7 +241,16 @@ class Context:
         return self._model
 
     def load_prompts(self, specification: DatasetSpecification) -> list[Prompt]:
-        return load_prompts(self._settings, specification)
+        prompts = load_prompts(self._settings, specification)
+        self._dataset_specifications_by_prompt_list[self._cache_key(prompts)] = (
+            [
+                dataset_specification.model_dump()
+                for dataset_specification in specification
+            ]
+            if isinstance(specification, list)
+            else specification.model_dump()
+        )
+        return prompts
 
 
 class Plugin:

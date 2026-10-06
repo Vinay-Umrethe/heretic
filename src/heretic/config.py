@@ -427,6 +427,17 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    response_log_dir: str | None = Field(
+        default=None,
+        description=(
+            'Directory to write responses.jsonl to, e.g. "responses". Each row '
+            "records the model responses for one prompt set used by a scorer, "
+            "enabling offline analysis of scorer behavior without parsing console "
+            "output. Disabled by default."
+        ),
+        exclude=True,
+    )
+
     benchmarks: list[BenchmarkSpecification] = Field(
         default=[
             BenchmarkSpecification(

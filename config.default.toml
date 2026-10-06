@@ -96,6 +96,10 @@ n_startup_trials = 30
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 
+# Directory to write responses.jsonl (per-trial prompt/response/verdict log)
+# to. Disabled by default; set to a directory name (e.g. "responses") to enable.
+# response_log_dir = "responses"
+
 # Maximum size for individual safetensors files generated when exporting a model.
 max_shard_size = "5GB"
 
