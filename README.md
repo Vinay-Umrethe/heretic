@@ -9,8 +9,6 @@
 Remove censorship &middot; Suppress slop &middot; Reduce sycophancy &middot; And more...<br>
 *In an afternoon, on your gaming PC.*
 
-<br>
-
 [![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT)
 [![Matrix](https://img.shields.io/badge/Matrix-black?logo=matrix&style=for-the-badge)](https://matrix.to/#/#heretic:matrix.org)
 [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org)
@@ -19,8 +17,6 @@ Remove censorship &middot; Suppress slop &middot; Reduce sycophancy &middot; And
 </div>
 
 ---
-
-&nbsp;
 
 [![#1 Repository of the Day](https://trendshift.io/api/badge/repositories/20538)](https://trendshift.io/repositories/20538)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[![Statistics](https://github.com/user-attachments/assets/c9b5a660-7ef9-43c7-991c-fd9d63ea8bd8)](https://heretic.sdad.pro/)
 
